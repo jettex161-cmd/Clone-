@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Pixel Agent</string>
+    <string name="a11y_description">Lets Pixel Agent read the screen and tap, type and scroll in other apps when you ask it to operate your phone. It does nothing on its own.</string>
+</resources>

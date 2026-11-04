@@ -1,0 +1,6 @@
+// Keep the Android and Kotlin plugins aligned with LiteRT-LM's Kotlin 2.2 metadata.
+plugins {
+    id("com.android.application") version "8.10.1" apply false
+    id("org.jetbrains.kotlin.android") version "2.2.21" apply false
+    id("org.jetbrains.kotlin.plugin.compose") version "2.2.21" apply false
+}
