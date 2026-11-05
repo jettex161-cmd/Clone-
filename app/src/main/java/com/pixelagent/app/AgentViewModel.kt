@@ -33,6 +33,7 @@ import com.pixelagent.app.core.LocalLlm
 import com.pixelagent.app.platform.LiteRtClient
 import com.pixelagent.app.core.newId
 import com.pixelagent.app.platform.AgentService
+import com.pixelagent.app.platform.AndroidDocumentIndexer
 import com.pixelagent.app.platform.AndroidPlatform
 import com.pixelagent.app.platform.Perms
 import com.pixelagent.app.platform.SettingsStore
@@ -49,6 +50,7 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     private val settingsStore = SettingsStore(app)
     private val chatStore = ChatStore(File(app.filesDir, "chats"))
     val memory = MemoryStore(File(app.filesDir, "memory.json"))
+    private val documentIndexer = AndroidDocumentIndexer(app, memory)
     private val platform = AndroidPlatform(app)
     private val registry = ToolRegistry.default()
     private val sessionAllowed = HashSet<String>()
@@ -62,6 +64,8 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     var chats by mutableStateOf<List<ChatMeta>>(emptyList())
         private set
     var currentChatId by mutableStateOf(newId())
+        private set
+    var currentChatExcludedFromLearning by mutableStateOf(false)
         private set
     var messages by mutableStateOf<List<Msg>>(emptyList())
         private set
@@ -137,7 +141,7 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
         val snapshot = messages
         if (snapshot.isEmpty()) return
         try {
-            chatStore.save(currentChatId, titleOf(snapshot), snapshot)
+            chatStore.save(currentChatId, titleOf(snapshot), snapshot, currentChatExcludedFromLearning)
             refreshChats()
         } catch (e: Exception) {
             // storage problems must never crash a run
@@ -147,6 +151,7 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     fun newChat() {
         if (running) return
         currentChatId = newId()
+        currentChatExcludedFromLearning = false
         messages = emptyList()
         attachments = emptyList()
     }
@@ -154,7 +159,13 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
     fun openChat(id: String) {
         if (running) return
         currentChatId = id
+        currentChatExcludedFromLearning = chatStore.list().firstOrNull { it.id == id }?.excludedFromLearning ?: false
         messages = chatStore.load(id)
+    }
+
+    fun excludeCurrentChatFromLearning(excluded: Boolean) {
+        currentChatExcludedFromLearning = excluded
+        persist()
     }
 
     fun deleteChat(id: String) {
@@ -272,13 +283,52 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
 
     fun addMemory(text: String) {
         if (text.isBlank()) return
-        memory.add(text)
+        if (memory.add(text, settings.projectId) == null) {
+            toast = "This memory was not saved because it was empty or may contain a secret."
+            return
+        }
         refreshMemory()
     }
 
     fun deleteMemory(id: String) {
         memory.delete(id)
         refreshMemory()
+    }
+
+    fun updateMemory(id: String, text: String) {
+        memory.update(id, text)
+        refreshMemory()
+    }
+
+    fun clearProjectMemory() {
+        memory.clearProject(settings.projectId)
+        refreshMemory()
+    }
+
+    fun indexDocument(path: String) {
+        if (!settings.persistentMemoryEnabled || !settings.learnFromDocuments) {
+            toast = "Enable persistent memory and document learning in Settings first."
+            return
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            val result = try {
+                val indexed = documentIndexer.index(File(path), settings.projectId, Canceller())
+                if (indexed.duplicate) "This file is already indexed and unchanged."
+                else "Indexed ${indexed.chunkCount} excerpts from ${File(path).name}."
+            } catch (e: Exception) {
+                "Indexing failed: ${e.message ?: e.javaClass.simpleName}"
+            }
+            withContext(Dispatchers.Main) {
+                toast = result
+                refreshMemory()
+            }
+        }
+    }
+
+    fun removeDocumentIndex(path: String) {
+        memory.removeDocument(path, settings.projectId)
+        refreshMemory()
+        toast = "Removed this project's index; the original file was kept."
     }
 
     // ── attachments (share sheet / picker) ────────────────────────────────
@@ -336,7 +386,8 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
         } catch (e: Exception) {
             // The foreground service is a nice-to-have; the run continues without it.
         }
-        val eng = AgentEngine(provider, settings, workspaceDir(), platform, memory, registry, sessionAllowed, listener)
+        val runSettings = if (currentChatExcludedFromLearning) settings.copy(persistentMemoryEnabled = false, learnFromDocuments = false) else settings
+        val eng = AgentEngine(provider, runSettings, workspaceDir(), platform, memory, registry, sessionAllowed, listener, profiles, documentIndexer)
         engine = eng
         job = viewModelScope.launch(Dispatchers.IO) {
             val result = eng.run(history)
@@ -377,6 +428,11 @@ class AgentViewModel(app: Application) : AndroidViewModel(app) {
         override fun onMessages(messages: List<Msg>) {
             this@AgentViewModel.messages = messages
             if (messages.lastOrNull()?.role == Role.TOOL) persist()
+        }
+
+        override fun onCheckpoint(messages: List<Msg>) {
+            this@AgentViewModel.messages = messages
+            persist()
         }
 
         override fun onState(state: String, detail: String) {

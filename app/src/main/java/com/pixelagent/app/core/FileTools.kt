@@ -165,6 +165,18 @@ fun fileTools(): List<Tool> = listOf(
     },
 
     Tool(
+        "index_document", "Extract and index a supported local document for future project-specific retrieval. The original file is never modified.", Risk.WRITE,
+        objectSchema(P("path", "string", "Document path inside the workspace", required = true)),
+        group = "document"
+    ) { a, ctx ->
+        val f = ctx.resolve(a.req("path"))
+        val indexer = ctx.documentIndexer ?: throw ToolError("Document indexing is unavailable in this build.")
+        val result = indexer.index(f, ctx.settings.projectId, ctx.canceller)
+        if (result.duplicate) "${f.name} is already indexed and unchanged."
+        else "Indexed ${result.chunkCount} excerpt(s) from ${f.name} in project '${ctx.settings.projectId}'. The original file was not changed."
+    },
+
+    Tool(
         "write_file", "Create or overwrite a text file (parent folders are created). Set append=true to add to the end.", Risk.WRITE,
         objectSchema(
             P("path", "string", "File path", required = true),

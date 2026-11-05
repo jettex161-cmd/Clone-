@@ -232,24 +232,43 @@ fun shellTool(): Tool = Tool(
 fun memoryTools(): List<Tool> = listOf(
     Tool(
         "memory_save", "Remember a fact about the user or their preferences permanently (shown to you in every future chat).", Risk.WRITE,
-        objectSchema(P("text", "string", "A short, self-contained fact to remember", required = true))
+        objectSchema(P("text", "string", "A short, self-contained fact to remember", required = true)), group = "memory"
     ) { a, ctx ->
-        val e = ctx.memory.add(a.req("text"))
+        val e = ctx.memory.add(a.req("text"), ctx.settings.projectId)
+            ?: throw ToolError("This memory was not saved because it was empty or may contain a secret.")
         "Saved memory ${e.id}"
     },
 
     Tool(
         "memory_list", "List everything you have remembered.", Risk.READ,
-        objectSchema()
+        objectSchema(), group = "memory"
     ) { _, ctx ->
-        val all = ctx.memory.all()
+        val all = ctx.memory.all().filter { it.projectId == "general" || it.projectId == ctx.settings.projectId }
         if (all.isEmpty()) "No memories saved." else all.joinToString("\n") { "[${it.id}] ${it.text}" }
     },
 
     Tool(
-        "memory_delete", "Forget a saved memory by its id.", Risk.WRITE,
-        objectSchema(P("id", "string", "Memory id from memory_list", required = true))
+        "memory_search", "Search saved general and current-project knowledge for relevant facts or document excerpts.", Risk.READ,
+        objectSchema(P("query", "string", "Keywords to search for", required = true)), group = "memory"
     ) { a, ctx ->
-        if (ctx.memory.delete(a.req("id"))) "Deleted memory ${a.str("id")}" else throw ToolError("No memory with id ${a.str("id")}")
+        val found = ctx.memory.search(a.req("query"), ctx.settings.projectId, 8)
+        if (found.isEmpty()) "No relevant saved knowledge found." else found.joinToString("\n") { "[${it.id}] ${it.text}" }
+    },
+
+    Tool(
+        "memory_update", "Correct or replace a saved fact by its id.", Risk.WRITE,
+        objectSchema(
+            P("id", "string", "Memory id from memory_list or memory_search", required = true),
+            P("text", "string", "Corrected fact", required = true)
+        ), group = "memory"
+    ) { a, ctx ->
+        if (ctx.memory.update(a.req("id"), a.req("text"), ctx.settings.projectId)) "Updated memory ${a.str("id")}" else throw ToolError("Memory could not be updated; it may be missing, outside this project, empty, or contain a secret.")
+    },
+
+    Tool(
+        "memory_delete", "Forget a saved memory by its id.", Risk.WRITE,
+        objectSchema(P("id", "string", "Memory id from memory_list", required = true)), group = "memory"
+    ) { a, ctx ->
+        if (ctx.memory.delete(a.req("id"), ctx.settings.projectId)) "Deleted memory ${a.str("id")}" else throw ToolError("No memory with id ${a.str("id")} in this project")
     }
 )

@@ -119,10 +119,15 @@ class LiteRtClient(private val ctx: Context) : LlmClient {
         }
 
         val out = StringBuilder()
+        val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(req.timeoutMs.toLong())
         try {
             while (true) {
                 if (canceller.cancelled) throw CancelledException()
-                val item = queue.poll(150, TimeUnit.MILLISECONDS) ?: continue
+                val item = queue.poll(150, TimeUnit.MILLISECONDS)
+                if (item == null) {
+                    if (System.nanoTime() >= deadline) throw IOException("The on-device model timed out after ${req.timeoutMs / 1000}s.")
+                    continue
+                }
                 if (item === done) break
                 if (item is Throwable) {
                     if (canceller.cancelled) throw CancelledException()

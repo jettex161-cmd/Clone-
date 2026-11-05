@@ -71,6 +71,9 @@ interface AgentListener {
     /** A new snapshot of the conversation (streaming text, tool results...). */
     fun onMessages(messages: List<Msg>)
 
+    /** A durable boundary before/after an external side effect. */
+    fun onCheckpoint(messages: List<Msg>) = onMessages(messages)
+
     /** What the agent is doing right now: state is "thinking", "tool" or "idle". */
     fun onState(state: String, detail: String)
 
@@ -91,7 +94,8 @@ class ToolContext(
     val platform: Platform,
     val memory: MemoryStore,
     val canceller: Canceller,
-    val listener: AgentListener?
+    val listener: AgentListener?,
+    val documentIndexer: DocumentIndexer? = null
 ) {
     private val dateFmt = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US)
 
@@ -155,6 +159,8 @@ class ToolRegistry(val tools: List<Tool>) {
     fun isEnabled(t: Tool, settings: AgentSettings): Boolean = when (t.group) {
         "shell" -> settings.shellEnabled
         "screen" -> settings.screenControlEnabled
+        "memory" -> settings.persistentMemoryEnabled
+        "document" -> settings.persistentMemoryEnabled && settings.learnFromDocuments
         else -> true
     }
 

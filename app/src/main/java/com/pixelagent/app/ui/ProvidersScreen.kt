@@ -139,6 +139,7 @@ private fun ProviderEditor(initial: ProviderProfile, isNew: Boolean, vm: AgentVi
     var maxTokens by remember { mutableStateOf(initial.maxTokens.toString()) }
     var toolMode by remember { mutableStateOf(initial.toolMode) }
     var vision by remember { mutableStateOf(initial.vision) }
+    var visionVerified by remember { mutableStateOf(initial.visionVerified) }
     var showKey by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf("") }
     var busy by remember { mutableStateOf(false) }
@@ -160,7 +161,8 @@ private fun ProviderEditor(initial: ProviderProfile, isNew: Boolean, vm: AgentVi
         temperature = temperature.toDouble(),
         maxTokens = maxTokens.toIntOrNull()?.coerceIn(64, 200000) ?: 4096,
         toolMode = toolMode,
-        vision = vision
+        vision = vision,
+        visionVerified = visionVerified
     )
 
     Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false)) {
@@ -251,7 +253,14 @@ private fun ProviderEditor(initial: ProviderProfile, isNew: Boolean, vm: AgentVi
                     "Native = the model's built-in function calling (best for Claude, GPT, Gemini…). Text = prompt-based, works with any model including small local ones. Off = plain chat.",
                     color = Dim, fontSize = 11.sp, lineHeight = 15.sp
                 )
-                SwitchRow("Send images to the model", "Turn off for text-only models", vision) { vision = it }
+                SwitchRow(
+                    "Verified image support",
+                    "Enable only after confirming this exact model accepts image input. Unverified models will never receive attached images.",
+                    visionVerified
+                ) {
+                    visionVerified = it
+                    vision = it
+                }
                 if (status.isNotEmpty()) Text(status, color = if (status.startsWith("✗")) Danger else Ok, fontSize = 12.sp, modifier = Modifier.padding(vertical = 6.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
                     OutlinedButton(

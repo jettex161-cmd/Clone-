@@ -11,7 +11,8 @@ class ChatRequest(
     val system: String,
     val messages: List<Msg>,
     val tools: List<ToolSpec>,
-    val platform: Platform
+    val platform: Platform,
+    val timeoutMs: Int = 300000
 )
 
 class AssistantTurn(val text: String, val toolCalls: List<ToolCall>, val stopReason: String)
@@ -50,6 +51,7 @@ private class CallAcc {
     var id = ""
     var name = ""
     val args = StringBuilder()
+    var providerMetadata = JSONObject()
 }
 
 private fun requireModel(p: ProviderProfile) {
@@ -83,13 +85,17 @@ class OpenAiClient : LlmClient {
         return h
     }
 
-    private fun buildMessages(req: ChatRequest): JSONArray {
+    internal fun buildMessages(req: ChatRequest): JSONArray {
         val arr = JSONArray()
+        val isGeminiEndpoint = req.profile.baseUrl.contains("generativelanguage.googleapis.com", ignoreCase = true)
         if (req.system.isNotBlank()) arr.put(jsonOf("role" to "system", "content" to req.system))
         for (m in req.messages) {
             when (m.role) {
                 Role.USER -> {
-                    val imgs = if (req.profile.vision) m.images.mapNotNull { req.platform.encodeImage(it) } else emptyList()
+                    if (m.images.isNotEmpty() && !(req.profile.vision && req.profile.visionVerified)) throw IOException("Provider '${req.profile.name}' has no user-verified image support; the attached image was not sent.")
+                    val imgs = m.images.map { path ->
+                        req.platform.encodeImage(path) ?: throw IOException("Could not read attached image '$path'; it was not sent to the model.")
+                    }
                     if (imgs.isEmpty()) {
                         arr.put(jsonOf("role" to "user", "content" to m.text.ifEmpty { " " }))
                     } else {
@@ -114,12 +120,17 @@ class OpenAiClient : LlmClient {
                     if (m.toolCalls.isNotEmpty()) {
                         val tcs = JSONArray()
                         for (c in m.toolCalls) {
-                            tcs.put(
-                                jsonOf(
-                                    "id" to c.id, "type" to "function",
-                                    "function" to jsonOf("name" to c.name, "arguments" to c.args.toString())
-                                )
+                            val toolCall = jsonOf(
+                                "id" to c.id, "type" to "function",
+                                "function" to jsonOf("name" to c.name, "arguments" to c.args.toString())
                             )
+                            if (isGeminiEndpoint) {
+                                c.providerMetadata.optJSONObject("extra_content")?.let { toolCall.put("extra_content", it) }
+                                if (c.providerMetadata.has("thought_signature")) {
+                                    toolCall.put("thought_signature", c.providerMetadata.get("thought_signature"))
+                                }
+                            }
+                            tcs.put(toolCall)
                         }
                         o.put("tool_calls", tcs)
                     }
@@ -209,6 +220,8 @@ class OpenAiClient : LlmClient {
                     calls[idx] = acc
                 }
                 if (id.isNotEmpty()) acc.id = id
+                tc.optJSONObject("extra_content")?.let { acc.providerMetadata.put("extra_content", it) }
+                if (tc.has("thought_signature")) acc.providerMetadata.put("thought_signature", tc.get("thought_signature"))
                 if (fn != null) {
                     val n = fn.str("name")
                     if (n.isNotEmpty()) acc.name = n
@@ -243,7 +256,7 @@ class OpenAiClient : LlmClient {
             if (fr.isNotEmpty()) finish = fr
         }
 
-        Http.streamLines(url, "POST", headers(p, true), buildBody(req, variant), canceller) { line ->
+        Http.streamLines(url, "POST", headers(p, true), buildBody(req, variant), canceller, readTimeoutMs = req.timeoutMs) { line ->
             val l = line.trimEnd()
             if (l.startsWith("data:")) {
                 val payload = l.substring(5).trim()
@@ -281,7 +294,7 @@ class OpenAiClient : LlmClient {
         var n = 0
         for (c in calls.values) {
             if (c.name.isEmpty()) continue
-            list.add(ToolCall(c.id.ifEmpty { "call_${System.nanoTime()}_$n" }, c.name, parseToolArgs(c.args.toString())))
+            list.add(ToolCall(c.id.ifEmpty { "call_${System.nanoTime()}_$n" }, c.name, parseToolArgs(c.args.toString()), c.providerMetadata))
             n++
         }
         return AssistantTurn(text.toString(), list, finish)
@@ -359,16 +372,16 @@ class AnthropicClient : LlmClient {
                 Role.USER -> {
                     flush()
                     val blocks = JSONArray()
-                    if (req.profile.vision) {
-                        for (path in m.images) {
-                            val img = req.platform.encodeImage(path) ?: continue
-                            blocks.put(
-                                jsonOf(
-                                    "type" to "image",
-                                    "source" to jsonOf("type" to "base64", "media_type" to img.mime, "data" to img.base64)
-                                )
+                    if (m.images.isNotEmpty() && !(req.profile.vision && req.profile.visionVerified)) throw IOException("Provider '${req.profile.name}' has no user-verified image support; the attached image was not sent.")
+                    for (path in m.images) {
+                        val img = req.platform.encodeImage(path)
+                            ?: throw IOException("Could not read attached image '$path'; it was not sent to the model.")
+                        blocks.put(
+                            jsonOf(
+                                "type" to "image",
+                                "source" to jsonOf("type" to "base64", "media_type" to img.mime, "data" to img.base64)
                             )
-                        }
+                        )
                     }
                     if (m.text.isNotBlank() || blocks.length() == 0) {
                         blocks.put(jsonOf("type" to "text", "text" to m.text.ifBlank { " " }))
@@ -476,7 +489,7 @@ class AnthropicClient : LlmClient {
             }
         }
 
-        Http.streamLines(url, "POST", headers(p, true), buildBody(req, withTemp), canceller) { line ->
+        Http.streamLines(url, "POST", headers(p, true), buildBody(req, withTemp), canceller, readTimeoutMs = req.timeoutMs) { line ->
             val l = line.trim()
             if (l.startsWith("data:")) {
                 val payload = l.substring(5).trim()

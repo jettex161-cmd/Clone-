@@ -5,8 +5,15 @@ import org.json.JSONObject
 import java.util.UUID
 
 enum class Role { USER, ASSISTANT, TOOL, NOTE }
+enum class ToolExecutionState { PENDING, AWAITING_CONFIRMATION, EXECUTING, SUCCEEDED, FAILED, INTERRUPTED }
 
-data class ToolCall(val id: String, val name: String, val args: JSONObject)
+data class ToolCall(
+    val id: String,
+    val name: String,
+    val args: JSONObject,
+    val providerMetadata: JSONObject = JSONObject(),
+    val executionState: ToolExecutionState = ToolExecutionState.PENDING
+)
 
 /** One entry of a conversation. NOTE messages are UI-only notices and are never sent to a model. */
 data class Msg(
@@ -26,7 +33,10 @@ data class Msg(
         if (toolCalls.isNotEmpty()) {
             val a = JSONArray()
             for (c in toolCalls) {
-                a.put(jsonOf("id" to c.id, "name" to c.name, "args" to c.args))
+                val call = jsonOf("id" to c.id, "name" to c.name, "args" to c.args)
+                if (c.providerMetadata.length() > 0) call.put("providerMetadata", c.providerMetadata)
+                call.put("executionState", c.executionState.name)
+                a.put(call)
             }
             o.put("toolCalls", a)
         }
@@ -44,7 +54,11 @@ data class Msg(
             val ca = o.arr("toolCalls")
             if (ca != null) {
                 for (c in ca.objects()) {
-                    calls.add(ToolCall(c.str("id"), c.str("name"), c.obj("args") ?: JSONObject()))
+                    calls.add(ToolCall(
+                        c.str("id"), c.str("name"), c.obj("args") ?: JSONObject(),
+                        c.obj("providerMetadata") ?: JSONObject(),
+                        try { ToolExecutionState.valueOf(c.str("executionState", "PENDING")) } catch (_: IllegalArgumentException) { ToolExecutionState.PENDING }
+                    ))
                 }
             }
             val role = try {
@@ -72,6 +86,8 @@ enum class ProviderType { OPENAI, ANTHROPIC, LOCAL }
 /** How tools are offered to the model. NATIVE = API function calling; TEXT = prompt-based (works with any model). */
 enum class ToolMode { NATIVE, TEXT, NONE }
 
+enum class ModelRoutingMode { MANUAL, LOCAL_ONLY, LOCAL_FIRST, CLOUD_ONLY }
+
 enum class ConfirmMode { NEVER, RISKY, WRITES, ALL }
 
 fun newId(): String = UUID.randomUUID().toString().replace("-", "").substring(0, 10)
@@ -86,12 +102,13 @@ data class ProviderProfile(
     val temperature: Double = 0.7,
     val maxTokens: Int = 4096,
     val toolMode: ToolMode = ToolMode.NATIVE,
-    val vision: Boolean = true
+    val vision: Boolean = true,
+    val visionVerified: Boolean = false
 ) {
     fun toJson(): JSONObject = jsonOf(
         "id" to id, "name" to name, "type" to type.name, "baseUrl" to baseUrl,
         "apiKey" to apiKey, "model" to model, "temperature" to temperature,
-        "maxTokens" to maxTokens, "toolMode" to toolMode.name, "vision" to vision
+        "maxTokens" to maxTokens, "toolMode" to toolMode.name, "vision" to vision, "visionVerified" to visionVerified
     )
 
     companion object {
@@ -105,7 +122,8 @@ data class ProviderProfile(
             temperature = o.dbl("temperature", 0.7),
             maxTokens = o.int("maxTokens", 4096),
             toolMode = try { ToolMode.valueOf(o.str("toolMode", "NATIVE")) } catch (e: IllegalArgumentException) { ToolMode.NATIVE },
-            vision = o.bool("vision", true)
+            vision = o.bool("vision", true),
+            visionVerified = o.bool("visionVerified", false)
         )
     }
 }
@@ -157,6 +175,13 @@ data class AgentSettings(
     val maxSteps: Int = 25,
     val maxToolOutputChars: Int = 12000,
     val contextChars: Int = 100000,
+    val modelRoutingMode: ModelRoutingMode = ModelRoutingMode.MANUAL,
+    val allowCloudFallback: Boolean = false,
+    val maxModelSwitches: Int = 1,
+    val modelTimeoutSeconds: Int = 120,
+    val projectId: String = "general",
+    val persistentMemoryEnabled: Boolean = true,
+    val learnFromDocuments: Boolean = false,
     val shellEnabled: Boolean = true,
     val screenControlEnabled: Boolean = true,
     val speakReplies: Boolean = false,
@@ -167,6 +192,10 @@ data class AgentSettings(
         "systemPrompt" to systemPrompt, "workspacePath" to workspacePath,
         "allowOutsideWorkspace" to allowOutsideWorkspace, "confirmMode" to confirmMode.name,
         "maxSteps" to maxSteps, "maxToolOutputChars" to maxToolOutputChars, "contextChars" to contextChars,
+        "modelRoutingMode" to modelRoutingMode.name, "allowCloudFallback" to allowCloudFallback,
+        "maxModelSwitches" to maxModelSwitches, "modelTimeoutSeconds" to modelTimeoutSeconds,
+        "projectId" to projectId,
+        "persistentMemoryEnabled" to persistentMemoryEnabled, "learnFromDocuments" to learnFromDocuments,
         "shellEnabled" to shellEnabled, "screenControlEnabled" to screenControlEnabled,
         "speakReplies" to speakReplies, "sauceNaoKey" to sauceNaoKey, "searxngUrl" to searxngUrl
     )
@@ -189,6 +218,13 @@ data class AgentSettings(
                 maxSteps = o.int("maxSteps", d.maxSteps).coerceIn(1, 200),
                 maxToolOutputChars = o.int("maxToolOutputChars", d.maxToolOutputChars).coerceIn(500, 200000),
                 contextChars = o.int("contextChars", d.contextChars).coerceIn(4000, 2000000),
+                modelRoutingMode = try { ModelRoutingMode.valueOf(o.str("modelRoutingMode", "MANUAL")) } catch (e: IllegalArgumentException) { ModelRoutingMode.MANUAL },
+                allowCloudFallback = o.bool("allowCloudFallback", d.allowCloudFallback),
+                maxModelSwitches = o.int("maxModelSwitches", d.maxModelSwitches).coerceIn(0, 5),
+                modelTimeoutSeconds = o.int("modelTimeoutSeconds", d.modelTimeoutSeconds).coerceIn(15, 600),
+                projectId = o.str("projectId", d.projectId).trim().ifEmpty { "general" }.take(80),
+                persistentMemoryEnabled = o.bool("persistentMemoryEnabled", d.persistentMemoryEnabled),
+                learnFromDocuments = o.bool("learnFromDocuments", d.learnFromDocuments),
                 shellEnabled = o.bool("shellEnabled", d.shellEnabled),
                 screenControlEnabled = o.bool("screenControlEnabled", d.screenControlEnabled),
                 speakReplies = o.bool("speakReplies", d.speakReplies),

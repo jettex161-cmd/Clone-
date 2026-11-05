@@ -103,6 +103,18 @@ fun FilesScreen(vm: AgentViewModel, onAskAbout: (String) -> Unit) {
                                 vm.toast = "No app can open this file"
                             }
                         })
+                        if (!f.isDirectory) {
+                            DropdownMenuItem(text = { Text("Index for ${vm.settings.projectId}") }, onClick = {
+                                menuFor = null
+                                vm.indexDocument(f.path)
+                            })
+                            if (vm.memories.any { it.kind == "document" && it.projectId == vm.settings.projectId && it.source == f.canonicalPath }) {
+                                DropdownMenuItem(text = { Text("Remove document index") }, onClick = {
+                                    menuFor = null
+                                    vm.removeDocumentIndex(f.canonicalPath)
+                                })
+                            }
+                        }
                         if (isImage) {
                             DropdownMenuItem(text = { Text("Attach to chat") }, onClick = {
                                 menuFor = null

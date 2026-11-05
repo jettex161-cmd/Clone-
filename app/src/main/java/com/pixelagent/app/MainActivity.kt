@@ -268,8 +268,9 @@ private fun AppRoot(vm: AgentViewModel, onPickImage: () -> Unit, onVoice: () -> 
                                     color = Gold, fontSize = 17.sp
                                 )
                                 Text(
-                                    if (vm.running) (if (vm.agentState == "tool") "working…" else "thinking…") else "ready",
-                                    color = if (vm.running) Cyan else Dim, fontSize = 11.sp
+                                    if (vm.running && vm.agentDetail.isNotBlank()) vm.agentDetail
+                                    else if (vm.running) (if (vm.agentState == "tool") "working…" else "thinking…") else "ready",
+                                    color = if (vm.running) Cyan else Dim, fontSize = 11.sp, maxLines = 1
                                 )
                             }
                         }

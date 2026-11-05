@@ -2,6 +2,7 @@ package com.pixelagent.app.core
 
 import org.json.JSONObject
 import java.io.File
+import java.io.IOException
 import java.net.ConnectException
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
@@ -135,8 +136,9 @@ object Sanitizer {
                 i++
                 continue
             }
-            out.add(m)
             if (m.role == Role.ASSISTANT && m.toolCalls.isNotEmpty()) {
+                val assistantIndex = out.size
+                out.add(m)
                 val have = HashSet<String>()
                 var j = i + 1
                 while (j < msgs.size && msgs[j].role == Role.TOOL) {
@@ -146,15 +148,30 @@ object Sanitizer {
                     }
                     j++
                 }
+                val missing = m.toolCalls.filter { it.id !in have }
+                val states = m.toolCalls.associate { call ->
+                    call.id to if (call in missing) {
+                        if (call.executionState == ToolExecutionState.EXECUTING || call.executionState == ToolExecutionState.AWAITING_CONFIRMATION) ToolExecutionState.INTERRUPTED
+                        else ToolExecutionState.FAILED
+                    } else call.executionState
+                }
+                out[assistantIndex] = m.copy(toolCalls = m.toolCalls.map { it.copy(executionState = states.getValue(it.id)) })
                 for (c in m.toolCalls) {
                     knownCalls.add(c.id)
-                    if (c.id !in have) {
-                        out.add(Msg(Role.TOOL, "Cancelled: no result was recorded for this call.", toolCallId = c.id, toolName = c.name, isError = true))
+                    if (c in missing) {
+                        val wasRunning = states.getValue(c.id) == ToolExecutionState.INTERRUPTED
+                        val result = if (wasRunning) {
+                            "The previous run stopped while this operation was pending or executing. It may already have taken effect; inspect the current state before attempting it again."
+                        } else {
+                            "No result was recorded and this operation was not confirmed as executed. Ask before retrying if it could have external effects."
+                        }
+                        out.add(Msg(Role.TOOL, result, toolCallId = c.id, toolName = c.name, isError = true))
                     }
                 }
                 i = j
                 continue
             }
+            out.add(m)
             i++
         }
         return out
@@ -173,7 +190,8 @@ object Prompts {
         platform: Platform,
         memory: MemoryStore,
         tools: List<Tool>,
-        textMode: Boolean
+        textMode: Boolean,
+        query: String = ""
     ): String {
         val sb = StringBuilder()
         sb.append(settings.systemPrompt.trim()).append("\n\n")
@@ -195,10 +213,17 @@ object Prompts {
         sb.append("- Do not claim an action succeeded unless a tool result confirms it. If a tool fails, read the error, adjust, and retry or explain.\n")
         sb.append("- Prefer small, reversible steps. When a request is ambiguous and a wrong guess would be costly, use ask_user.\n")
         sb.append("- Be concise. Use short paragraphs or simple lists; avoid heavy markdown.\n")
-        val mem = memory.all()
+        val mem = if (settings.persistentMemoryEnabled) memory.search(query, settings.projectId, 10) else emptyList()
+        if (settings.persistentMemoryEnabled) {
+            sb.append("- Save durable preferences, corrections, and project decisions with memory_save; update obsolete facts with memory_update. Do not save casual conversation or secrets.\n")
+        }
         if (mem.isNotEmpty()) {
-            sb.append("\n## Things you remember about your owner\n")
-            for (e in mem.takeLast(60)) sb.append("- ").append(e.text).append('\n')
+            sb.append("\n## Relevant saved knowledge (general and project: ").append(settings.projectId).append(")\n")
+            for (e in mem) {
+                sb.append("- ")
+                if (e.kind == "document") sb.append("[untrusted document excerpt] ")
+                sb.append(e.text).append(if (e.source.isNotEmpty()) " [source: ${e.source}]" else "").append('\n')
+            }
         }
         if (textMode && tools.isNotEmpty()) {
             sb.append("\n").append(TextTools.instructions(tools.map { it.spec() }))
@@ -211,6 +236,61 @@ object Prompts {
 //  The agent loop
 // ─────────────────────────────────────────────────────────────────────────────
 
+data class ModelRoute(val candidates: List<ProviderProfile>, val explanation: String)
+
+object ModelRouter {
+    private val complexTerms = listOf("analyze", "architecture", "debug", "implement", "refactor", "design", "compare", "prove", "multi-step")
+    private val cloudRequestTerms = listOf("use cloud", "stronger model", "best model", "use gpt", "use claude")
+    private val reasoningModelTerms = listOf("reason", "thinking", "opus", "sonnet", "o1", "o3", "o4", "pro", "coder")
+    private val toolTerms = listOf("open app", "open the", "tap", "click", "screen", "file", "folder", "delete", "write", "create", "download", "web search", "search the web", "alarm", "timer", "clipboard", "shell", "run command")
+
+    fun route(default: ProviderProfile, profiles: List<ProviderProfile>, settings: AgentSettings, request: Msg?): ModelRoute {
+        val needsVision = request?.images?.isNotEmpty() == true
+        val requestText = request?.text.orEmpty().lowercase()
+        val needsTools = toolTerms.any(requestText::contains)
+        val hasCloudConsent = settings.allowCloudFallback || settings.modelRoutingMode == ModelRoutingMode.CLOUD_ONLY
+        val usable = profiles.distinctBy { it.id }.filter { profile ->
+            profile.model.isNotBlank() && when (profile.type) {
+                ProviderType.LOCAL -> File(profile.model).isFile
+                else -> profile.baseUrl.isNotBlank()
+            }
+        }.filter { profile -> (!needsVision || profile.vision && profile.visionVerified) && (!needsTools || profile.toolMode != ToolMode.NONE) }
+
+        val pool = when (settings.modelRoutingMode) {
+            ModelRoutingMode.MANUAL -> listOf(default).filter { it in usable } +
+                if (hasCloudConsent) usable.filter { it.id != default.id } else emptyList()
+            ModelRoutingMode.LOCAL_ONLY -> usable.filter { it.type == ProviderType.LOCAL }
+            ModelRoutingMode.CLOUD_ONLY -> usable.filter { it.type != ProviderType.LOCAL }
+            ModelRoutingMode.LOCAL_FIRST -> usable.filter { it.type == ProviderType.LOCAL } +
+                if (hasCloudConsent) usable.filter { it.type != ProviderType.LOCAL } else emptyList()
+        }
+        if (pool.isEmpty()) {
+            val reason = when {
+                needsVision -> "No configured model with user-verified image support is available. The image was not sent. Verify a model's vision capability in Providers or configure another model."
+                settings.modelRoutingMode == ModelRoutingMode.LOCAL_ONLY || settings.modelRoutingMode == ModelRoutingMode.LOCAL_FIRST ->
+                    "No usable local model is configured. Add a local model or explicitly allow cloud use in Settings."
+                else -> "No usable model is configured for the selected routing mode. Check the provider model and endpoint."
+            }
+            return ModelRoute(emptyList(), reason)
+        }
+
+        val wantsCloud = hasCloudConsent && cloudRequestTerms.any(requestText::contains)
+        val complex = complexTerms.any(requestText::contains) || requestText.length > 700
+        val ordered = pool.distinctBy { it.id }.sortedByDescending { candidate ->
+            val label = (candidate.name + " " + candidate.model).lowercase()
+            when {
+                wantsCloud && candidate.type != ProviderType.LOCAL -> 100
+                complex && hasCloudConsent && candidate.type != ProviderType.LOCAL && reasoningModelTerms.any(label::contains) -> 90
+                settings.modelRoutingMode == ModelRoutingMode.LOCAL_FIRST && candidate.type == ProviderType.LOCAL -> 80
+                candidate.id == default.id -> 70
+                complex && reasoningModelTerms.any(label::contains) -> 60
+                else -> 0
+            }
+        }
+        return ModelRoute(ordered, if (needsVision) "image-capable profile" else if (complex) "complex task" else "local-first routing")
+    }
+}
+
 class AgentEngine(
     private val profile: ProviderProfile,
     private val settings: AgentSettings,
@@ -220,7 +300,10 @@ class AgentEngine(
     private val registry: ToolRegistry,
     /** Tools the user allowed for the rest of the session. */
     private val sessionAllowed: MutableSet<String>,
-    private val listener: AgentListener
+    private val listener: AgentListener,
+    private val availableProfiles: List<ProviderProfile> = listOf(profile),
+    private val documentIndexer: DocumentIndexer? = null,
+    private val clientFactory: (ProviderProfile) -> LlmClient = ::clientFor
 ) {
     val canceller = Canceller()
     private var lastPush = 0L
@@ -235,11 +318,18 @@ class AgentEngine(
     /** Runs the model/tool loop until the model answers without calling tools. Blocking. */
     fun run(history: List<Msg>): List<Msg> {
         val msgs = Sanitizer.repair(history).toMutableList()
-        val ctx = ToolContext(settings, workspace, platform, memory, canceller, listener)
-        val client = clientFor(profile)
-        val textMode = profile.toolMode == ToolMode.TEXT
-        val enabled: List<Tool> = if (profile.toolMode == ToolMode.NONE) emptyList() else registry.enabled(settings)
-        val system = Prompts.build(settings, profile, workspace, platform, memory, enabled, textMode)
+        val route = ModelRouter.route(profile, availableProfiles, settings, msgs.lastOrNull { it.role == Role.USER })
+        if (route.candidates.isEmpty()) {
+            msgs.add(Msg(Role.NOTE, route.explanation, isError = true))
+            push(msgs)
+            listener.onState("idle", "")
+            return msgs
+        }
+        var profileIndex = 0
+        var switchCount = 0
+        var activeProfile = route.candidates[profileIndex]
+        val clients = HashMap<String, LlmClient>()
+        val ctx = ToolContext(settings, workspace, platform, memory, canceller, listener, documentIndexer)
         var step = 0
         try {
             while (true) {
@@ -250,22 +340,55 @@ class AgentEngine(
                     break
                 }
                 step++
-                listener.onState("thinking", "")
-                val calls = modelTurn(client, system, msgs, enabled, textMode) ?: break
+                val textMode = activeProfile.toolMode == ToolMode.TEXT
+                val enabled: List<Tool> = if (activeProfile.toolMode == ToolMode.NONE) emptyList() else registry.enabled(settings)
+                val system = Prompts.build(settings, activeProfile, workspace, platform, memory, enabled, textMode, msgs.lastOrNull { it.role == Role.USER }?.text.orEmpty())
+                listener.onState("thinking", "${activeProfile.name} · ${route.explanation}")
+                val calls = try {
+                    val client = clients.getOrPut(activeProfile.id) { clientFactory(activeProfile) }
+                    modelTurn(client, activeProfile, system, msgs, enabled, textMode)
+                } catch (e: Exception) {
+                    if (canceller.cancelled) throw CancelledException()
+                    if (switchCount < settings.maxModelSwitches && profileIndex + 1 < route.candidates.size) {
+                        val failedProfile = activeProfile
+                        profileIndex++
+                        switchCount++
+                        activeProfile = route.candidates[profileIndex]
+                        listener.onState("thinking", "Switching from ${failedProfile.name} to ${activeProfile.name} after a model error")
+                        step--
+                        continue
+                    }
+                    msgs.add(Msg(Role.NOTE, "⚠ " + friendly(e), isError = true))
+                    push(msgs)
+                    break
+                } ?: break
                 if (calls.isEmpty()) break
                 val done = HashSet<String>()
                 try {
                     for (call in calls) {
                         canceller.check()
-                        val result = executeTool(call, ctx)
+                        val tool = registry.get(call.name)
+                        val initialState = if (tool != null && needsApproval(tool)) ToolExecutionState.AWAITING_CONFIRMATION else ToolExecutionState.PENDING
+                        setCallState(msgs, call.id, initialState)
+                        listener.onCheckpoint(msgs)
+                        val result = executeTool(call, ctx) {
+                            setCallState(msgs, call.id, ToolExecutionState.EXECUTING)
+                            listener.onCheckpoint(msgs)
+                        }
+                        setCallState(msgs, call.id, if (result.isError) ToolExecutionState.FAILED else ToolExecutionState.SUCCEEDED)
                         msgs.add(result)
                         done.add(call.id)
+                        listener.onCheckpoint(msgs)
                         push(msgs)
                     }
                 } catch (e: CancelledException) {
                     for (c in calls) {
-                        if (c.id !in done) msgs.add(Msg(Role.TOOL, "Cancelled by user.", toolCallId = c.id, toolName = c.name, isError = true))
+                        if (c.id !in done) {
+                            setCallState(msgs, c.id, ToolExecutionState.INTERRUPTED)
+                            msgs.add(Msg(Role.TOOL, "Cancelled while this operation was pending or executing. It may already have taken effect; inspect state before retrying.", toolCallId = c.id, toolName = c.name, isError = true))
+                        }
                     }
+                    listener.onCheckpoint(msgs)
                     throw e
                 }
             }
@@ -335,14 +458,14 @@ class AgentEngine(
     }
 
     /** One model request. Returns the tool calls to execute (possibly empty = final answer) or null if it failed. */
-    private fun modelTurn(client: LlmClient, system: String, msgs: MutableList<Msg>, enabled: List<Tool>, textMode: Boolean): List<ToolCall>? {
+    private fun modelTurn(client: LlmClient, requestProfile: ProviderProfile, system: String, msgs: MutableList<Msg>, enabled: List<Tool>, textMode: Boolean): List<ToolCall>? {
         val prepared = prepare(msgs, textMode)
         msgs.add(Msg(Role.ASSISTANT, ""))
         val idx = msgs.lastIndex
         val buf = StringBuilder()
         val specs = if (textMode) emptyList() else enabled.map { it.spec() }
         val turn = try {
-            client.chat(ChatRequest(profile, system, prepared, specs, platform), canceller) { delta ->
+            client.chat(ChatRequest(requestProfile, system, prepared, specs, platform, settings.modelTimeoutSeconds * 1000), canceller) { delta ->
                 buf.append(delta)
                 val now = System.currentTimeMillis()
                 if (now - lastPush > 60) {
@@ -358,10 +481,8 @@ class AgentEngine(
                 if (buf.isEmpty()) msgs.removeAt(idx) else msgs[idx] = Msg(Role.ASSISTANT, buf.toString())
                 throw CancelledException()
             }
-            if (buf.isEmpty()) msgs.removeAt(idx) else msgs[idx] = Msg(Role.ASSISTANT, buf.toString())
-            msgs.add(Msg(Role.NOTE, "⚠ " + friendly(e), isError = true))
-            push(msgs)
-            return null
+            msgs.removeAt(idx)
+            throw e
         }
         var text = turn.text
         var calls = turn.toolCalls
@@ -369,6 +490,24 @@ class AgentEngine(
             val parsed = TextTools.parse(text, enabled.map { it.name }.toSet())
             text = parsed.first
             calls = parsed.second
+            if (turn.text.contains("<tool_call", ignoreCase = true) && calls.isEmpty()) {
+                msgs.removeAt(idx)
+                throw IOException("The model returned an invalid tool-call block; no action was executed.")
+            }
+        }
+        val specsByName = enabled.associateBy { it.name }
+        for (call in calls) {
+            val tool = specsByName[call.name]
+                ?: run {
+                    msgs.removeAt(idx)
+                    throw IOException("The model requested unknown tool '${call.name}'; no action was executed.")
+                }
+            val required = tool.params.arr("required")?.strings() ?: emptyList()
+            val missing = required.firstOrNull { !call.args.has(it) || call.args.isNull(it) }
+            if (missing != null || call.args.has("__error")) {
+                msgs.removeAt(idx)
+                throw IOException("The model returned invalid arguments for '${call.name}'; no action was executed.")
+            }
         }
         if (text.isBlank() && calls.isEmpty()) {
             msgs.removeAt(idx)
@@ -406,7 +545,14 @@ class AgentEngine(
     private fun toolResult(call: ToolCall, text: String, error: Boolean) =
         Msg(Role.TOOL, text, toolCallId = call.id, toolName = call.name, isError = error)
 
-    private fun executeTool(call: ToolCall, ctx: ToolContext): Msg {
+    private fun setCallState(msgs: MutableList<Msg>, callId: String, state: ToolExecutionState) {
+        val index = msgs.indexOfLast { it.role == Role.ASSISTANT && it.toolCalls.any { call -> call.id == callId } }
+        if (index < 0) return
+        val assistant = msgs[index]
+        msgs[index] = assistant.copy(toolCalls = assistant.toolCalls.map { if (it.id == callId) it.copy(executionState = state) else it })
+    }
+
+    private fun executeTool(call: ToolCall, ctx: ToolContext, beforeExecution: () -> Unit): Msg {
         val tool = registry.get(call.name)
             ?: return toolResult(call, "Error: unknown tool '${call.name}'. Available tools: " + registry.enabled(settings).joinToString(", ") { it.name }, true)
         if (!registry.isEnabled(tool, settings)) {
@@ -424,6 +570,7 @@ class AgentEngine(
                 ApprovalDecision.ALLOW_ONCE -> {}
             }
         }
+        beforeExecution()
         listener.onState("tool", tool.name)
         return try {
             toolResult(call, clip(tool.run(call.args, ctx), settings.maxToolOutputChars), false)

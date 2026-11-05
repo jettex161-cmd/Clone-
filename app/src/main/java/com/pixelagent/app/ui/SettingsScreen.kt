@@ -18,6 +18,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -39,6 +40,8 @@ import androidx.compose.ui.unit.sp
 import com.pixelagent.app.AgentViewModel
 import com.pixelagent.app.core.AgentSettings
 import com.pixelagent.app.core.ConfirmMode
+import com.pixelagent.app.core.ModelRoutingMode
+import com.pixelagent.app.core.MemoryEntry
 import com.pixelagent.app.platform.Perms
 
 fun openAllFilesSettings(ctx: Context) {
@@ -81,6 +84,9 @@ fun SettingsScreen(vm: AgentViewModel) {
     @Suppress("UNUSED_VARIABLE")
     val tick = vm.permTick  // re-read permission state when returning from system settings
     var newMemory by remember { mutableStateOf("") }
+    var memoryQuery by remember { mutableStateOf("") }
+    var editingMemory by remember { mutableStateOf<MemoryEntry?>(null) }
+    var editingText by remember { mutableStateOf("") }
 
     fun upd(n: AgentSettings) = vm.updateSettings(n)
 
@@ -124,6 +130,10 @@ fun SettingsScreen(vm: AgentViewModel) {
 
         SectionTitle("Workspace")
         OutlinedTextField(
+            value = s.projectId, onValueChange = { upd(s.copy(projectId = it.trim().take(80).ifEmpty { "general" })) },
+            label = { Text("Project knowledge collection") }, singleLine = true, colors = fieldColors(), modifier = Modifier.fillMaxWidth()
+        )
+        OutlinedTextField(
             value = s.workspacePath, onValueChange = { upd(s.copy(workspacePath = it)) },
             label = { Text("Workspace folder (blank = automatic)") }, singleLine = true, colors = fieldColors(), modifier = Modifier.fillMaxWidth()
         )
@@ -151,6 +161,27 @@ fun SettingsScreen(vm: AgentViewModel) {
         SwitchRow("Shell command tool", "Lets the agent run commands via Android's sh (app permissions only).", s.shellEnabled) { upd(s.copy(shellEnabled = it)) }
         SwitchRow("Phone control tools", "screen_read / click / type / scroll. Also needs the accessibility service above.", s.screenControlEnabled) { upd(s.copy(screenControlEnabled = it)) }
 
+        SectionTitle("Model routing")
+        val routingModes = listOf(
+            ModelRoutingMode.MANUAL to "Manual provider selection",
+            ModelRoutingMode.LOCAL_ONLY to "Local only",
+            ModelRoutingMode.LOCAL_FIRST to "Local first",
+            ModelRoutingMode.CLOUD_ONLY to "Cloud only"
+        )
+        for ((mode, label) in routingModes) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                RadioButton(selected = s.modelRoutingMode == mode, onClick = { upd(s.copy(modelRoutingMode = mode)) })
+                Text(label, color = Color.White, fontSize = 13.sp, modifier = Modifier.weight(1f))
+            }
+        }
+        SwitchRow(
+            "Allow cloud fallback",
+                "When enabled, automatic routing may send this task and relevant history to configured cloud providers. Model capability flags are user-declared because provider model lists do not reliably report them.",
+            s.allowCloudFallback
+        ) { upd(s.copy(allowCloudFallback = it)) }
+        NumberField("Maximum automatic model switches", s.maxModelSwitches) { upd(s.copy(maxModelSwitches = it.coerceIn(0, 5))) }
+            NumberField("Model timeout (seconds)", s.modelTimeoutSeconds) { upd(s.copy(modelTimeoutSeconds = it.coerceIn(15, 600))) }
+
         SectionTitle("Limits")
         NumberField("Max steps per request", s.maxSteps) { upd(s.copy(maxSteps = it.coerceIn(1, 200))) }
         NumberField("Max characters per tool result", s.maxToolOutputChars) { upd(s.copy(maxToolOutputChars = it.coerceIn(500, 200000))) }
@@ -177,10 +208,31 @@ fun SettingsScreen(vm: AgentViewModel) {
         }
 
         SectionTitle("Memory")
-        Text("Facts the agent remembers in every chat. It can add its own with the memory_save tool.", color = Dim, fontSize = 12.sp)
-        for (m in vm.memories) {
+        SwitchRow("Exclude this conversation from learning", "This chat will not retrieve or save persistent knowledge. Existing files and memories are unchanged.", vm.currentChatExcludedFromLearning) {
+            vm.excludeCurrentChatFromLearning(it)
+        }
+        SwitchRow("Persistent memory", "Save and retrieve durable preferences, corrections, and project knowledge on this device.", s.persistentMemoryEnabled) {
+            upd(s.copy(persistentMemoryEnabled = it, learnFromDocuments = if (it) s.learnFromDocuments else false))
+        }
+        SwitchRow("Learn from selected documents", "Index only files you explicitly choose in Files. Originals are never modified; unsupported or unreadable files are reported.", s.learnFromDocuments) {
+            upd(s.copy(learnFromDocuments = it, persistentMemoryEnabled = s.persistentMemoryEnabled || it))
+        }
+        Text("Saved facts and indexed excerpts stay on this device. General knowledge is shared across projects.", color = Dim, fontSize = 12.sp)
+        OutlinedTextField(
+            value = memoryQuery, onValueChange = { memoryQuery = it }, label = { Text("Search saved knowledge") },
+            singleLine = true, colors = fieldColors(), modifier = Modifier.fillMaxWidth()
+        )
+        val visibleMemories = vm.memories.filter {
+            (it.projectId == "general" || it.projectId == s.projectId) &&
+                (memoryQuery.isBlank() || it.text.contains(memoryQuery, ignoreCase = true) || it.source.contains(memoryQuery, ignoreCase = true))
+        }
+        for (m in visibleMemories) {
             Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-                Text(m.text, color = Color.White, fontSize = 13.sp, modifier = Modifier.weight(1f))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(m.text, color = Color.White, fontSize = 13.sp)
+                    Text("${m.projectId} · ${m.kind}" + if (m.source.isNotEmpty()) " · ${m.source}" else "", color = Dim, fontSize = 10.sp, maxLines = 1)
+                }
+                if (m.kind == "fact") TextButton(onClick = { editingMemory = m; editingText = m.text }) { Text("Edit", color = Cyan) }
                 TextButton(onClick = { vm.deleteMemory(m.id) }) { Text("✕", color = Danger) }
             }
         }
@@ -195,10 +247,25 @@ fun SettingsScreen(vm: AgentViewModel) {
                 colors = ButtonDefaults.buttonColors(containerColor = Gold, contentColor = Black)
             ) { Text("Add") }
         }
+        TextButton(onClick = { vm.clearProjectMemory() }) { Text("Clear this project's saved knowledge", color = Danger, fontSize = 12.sp) }
 
         HorizontalDivider(color = Panel2, modifier = Modifier.padding(vertical = 20.dp))
-        Text("Pixel Agent 4.0 · your agent, your keys, your device.", color = Dim, fontSize = 12.sp)
+        Text("Pixel Agent 4.0.1 · your agent, your keys, your device.", color = Dim, fontSize = 12.sp)
         Spacer(Modifier.size(24.dp))
+    }
+
+    editingMemory?.let { entry ->
+        AlertDialog(
+            onDismissRequest = { editingMemory = null },
+            title = { Text("Edit memory") },
+            text = {
+                OutlinedTextField(value = editingText, onValueChange = { editingText = it }, label = { Text("Memory") }, colors = fieldColors())
+            },
+            confirmButton = {
+                TextButton(onClick = { vm.updateMemory(entry.id, editingText); editingMemory = null }) { Text("Save") }
+            },
+            dismissButton = { TextButton(onClick = { editingMemory = null }) { Text("Cancel") } }
+        )
     }
 }
 
